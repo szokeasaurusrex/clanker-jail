@@ -273,6 +273,7 @@ if ls "{}" >/dev/null 2>&1; then echo "FAIL real home is readable"; exit 20; fi
 if ls "{}/.ssh" >/dev/null 2>&1; then echo "FAIL ~/.ssh is readable"; exit 21; fi
 if printenv SSH_AUTH_SOCK >/dev/null 2>&1; then echo "FAIL SSH_AUTH_SOCK leaked"; exit 22; fi
 if printenv GITHUB_TOKEN >/dev/null 2>&1; then echo "FAIL GITHUB_TOKEN leaked"; exit 23; fi
+node -e 'if (process.stdin.isTTY) {{ process.stdin.setRawMode(true); process.stdin.setRawMode(false); }}'
 node --version >/dev/null
 pi --version >/dev/null
 /usr/bin/curl -sS -I -L --max-time 10 https://pi.dev >/dev/null
@@ -282,7 +283,7 @@ echo "doctor ok"
             shell_escape(&self.real_home)
         );
 
-        let args = vec!["-lc".to_string(), script];
+        let args = vec!["-c".to_string(), script];
         self.run_sandboxed("/bin/sh", &args)
     }
 
@@ -358,14 +359,16 @@ echo "doctor ok"
             Path::new("/usr/lib"),
             Path::new("/usr/libexec"),
             Path::new("/usr/share"),
-            Path::new("/System"),
+            Path::new("/System/Library"),
             Path::new("/Library/Apple"),
-            Path::new("/Library/Developer"),
-            Path::new("/private/etc"),
-            Path::new("/etc"),
-            Path::new("/dev"),
             Path::new("/opt/homebrew"),
-            Path::new("/var/db/timezone"),
+            Path::new("/etc/profile"),
+            Path::new("/etc/paths"),
+            Path::new("/etc/manpaths"),
+            Path::new("/etc/paths.d"),
+            Path::new("/etc/manpaths.d"),
+            Path::new("/private/etc/ssl/openssl.cnf"),
+            Path::new("/private/etc/ssl/cert.pem"),
         ] {
             if path.exists() {
                 read_paths.insert(canonical_or_absolute(path)?);
@@ -405,17 +408,17 @@ echo "doctor ok"
         profile.push_str("(allow file-map-executable)\n");
         profile.push_str("(allow file-read*");
         profile.push_str("\n  (literal \"/\")");
+        profile.push_str("\n  (literal \"/dev/tty\")");
+        profile.push_str("\n  (regex #\"^/dev/tty.*$\")");
         for path in read_paths {
             write!(profile, "\n  (subpath \"{}\")", sandbox_escape(&path))
                 .context("failed to build sandbox profile")?;
         }
         profile.push_str(")\n");
-        if let Some(tty_path) = &self.tty_path {
-            profile.push_str("(allow file-ioctl");
-            write!(profile, "\n  (literal \"{}\")", sandbox_escape(tty_path))
-                .context("failed to build sandbox profile")?;
-            profile.push_str(")\n");
-        }
+        profile.push_str("(allow file-ioctl");
+        profile.push_str("\n  (literal \"/dev/tty\")");
+        profile.push_str("\n  (regex #\"^/dev/tty.*$\")");
+        profile.push_str(")\n");
         profile.push_str("(allow file-write*");
         for path in write_paths {
             write!(profile, "\n  (subpath \"{}\")", sandbox_escape(&path))
@@ -425,6 +428,7 @@ echo "doctor ok"
             write!(profile, "\n  (literal \"{}\")", sandbox_escape(tty_path))
                 .context("failed to build sandbox profile")?;
         }
+        profile.push_str("\n  (regex #\"^/dev/tty.*$\")");
         for path in [
             "/dev/null",
             "/dev/zero",
