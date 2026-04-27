@@ -29,9 +29,10 @@ fn main() -> Result<()> {
             context.refuse_broad_cwd()?;
             context.prepare()?;
             if command.args.is_empty() {
-                command.args.push("/login".to_string());
+                command.args.push("login".to_string());
             }
-            context.run_sandboxed("pi", &command.args)
+            command.args.insert(0, "@mariozechner/pi-ai".to_string());
+            context.run_sandboxed("npx", &command.args)
         }
         Commands::GithubLogin(options) => {
             let context = JailContext::new(options)?;
@@ -69,7 +70,7 @@ struct Cli {
 enum Commands {
     /// Launch Pi in the current directory.
     Pi(PiCommand),
-    /// Launch Pi's login flow in the fake home.
+    /// Launch @mariozechner/pi-ai's CLI login flow in the jail.
     PiLogin(PiCommand),
     /// Store a limited GitHub HTTPS token in the fake home.
     GithubLogin(JailOptions),

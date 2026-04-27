@@ -24,7 +24,7 @@ Forward Pi arguments after `--`:
 cargo run -- pi -- --model gpt-5.2
 ```
 
-Run Pi's login flow with auth state persisted only in the fake home:
+Run the `@mariozechner/pi-ai` CLI login flow in the jail:
 
 ```sh
 cargo run -- pi-login
