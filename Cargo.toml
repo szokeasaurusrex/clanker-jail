@@ -1,0 +1,20 @@
+[package]
+name = "clanker-jail"
+version = "0.1.0"
+edition = "2024"
+description = "Host-native macOS filesystem jail launcher for the Pi coding agent"
+license = "MIT"
+readme = "README.md"
+keywords = ["sandbox", "macos", "pi", "agent"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[lints.clippy]
+cargo = { level = "warn", priority = -1 }
+cargo-common-metadata = "allow"
+multiple-crate-versions = "allow"
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.49", features = ["derive"] }
