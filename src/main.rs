@@ -3,7 +3,6 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -22,22 +21,30 @@ fn main() -> Result<()> {
             let context = JailContext::new(command.options)?;
             context.refuse_broad_cwd()?;
             context.prepare()?;
-            context.run_sandboxed("pi", &command.args)
+            context.run_sandboxed("pi", &command.args, None)
         }
         Commands::PiLogin(mut command) => {
             let context = JailContext::new(command.options)?;
             context.refuse_broad_cwd()?;
             context.prepare()?;
+            context.ensure_agent_dir()?;
             if command.args.is_empty() {
                 command.args.push("login".to_string());
             }
             command.args.insert(0, "@mariozechner/pi-ai".to_string());
-            context.run_sandboxed("npx", &command.args)
+            context.run_sandboxed("npx", &command.args, Some(&context.agent_dir()))
         }
         Commands::GithubLogin(options) => {
             let context = JailContext::new(options)?;
+            context.refuse_broad_cwd()?;
             context.prepare()?;
-            context.github_login()
+            context.ensure_agent_dir()?;
+            let args = vec![
+                "@mariozechner/pi-ai".to_string(),
+                "login".to_string(),
+                "github-copilot".to_string(),
+            ];
+            context.run_sandboxed("npx", &args, Some(&context.agent_dir()))
         }
         Commands::Doctor(options) => {
             let context = JailContext::new(options)?;
@@ -201,6 +208,25 @@ impl JailContext {
                 )
             },
         )?;
+        self.ensure_agent_dir()?;
+        Ok(())
+    }
+
+    fn agent_dir(&self) -> PathBuf {
+        self.fake_home.join(".pi/agent")
+    }
+
+    fn ensure_agent_dir(&self) -> Result<()> {
+        let agent_dir = self.agent_dir();
+        fs::create_dir_all(&agent_dir).with_context(|| {
+            format!("failed to create agent directory `{}`", agent_dir.display())
+        })?;
+        fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "failed to restrict agent directory permissions `{}`",
+                agent_dir.display()
+            )
+        })?;
         Ok(())
     }
 
@@ -225,7 +251,12 @@ impl JailContext {
         Ok(())
     }
 
-    fn run_sandboxed(&self, program: &str, args: &[String]) -> Result<()> {
+    fn run_sandboxed(
+        &self,
+        program: &str,
+        args: &[String],
+        current_dir: Option<&Path>,
+    ) -> Result<()> {
         let profile_path = self.write_profile()?;
         let program_path = find_executable(program)?;
 
@@ -236,7 +267,7 @@ impl JailContext {
             .arg("--")
             .arg(program_path)
             .args(args)
-            .current_dir(&self.cwd)
+            .current_dir(current_dir.unwrap_or(&self.cwd))
             .env_clear()
             .envs(self.safe_env())
             .stdin(Stdio::inherit())
@@ -274,6 +305,7 @@ if ls "{}" >/dev/null 2>&1; then echo "FAIL real home is readable"; exit 20; fi
 if ls "{}/.ssh" >/dev/null 2>&1; then echo "FAIL ~/.ssh is readable"; exit 21; fi
 if printenv SSH_AUTH_SOCK >/dev/null 2>&1; then echo "FAIL SSH_AUTH_SOCK leaked"; exit 22; fi
 if printenv GITHUB_TOKEN >/dev/null 2>&1; then echo "FAIL GITHUB_TOKEN leaked"; exit 23; fi
+if [ -n "$PI_CODING_AGENT_DIR" ] && [ -f "$PI_CODING_AGENT_DIR/auth.json" ]; then :; fi
 node -e 'if (process.stdin.isTTY) {{ process.stdin.setRawMode(true); process.stdin.setRawMode(false); }}'
 node --version >/dev/null
 pi --version >/dev/null
@@ -285,57 +317,7 @@ echo "doctor ok"
         );
 
         let args = vec!["-c".to_string(), script];
-        self.run_sandboxed("/bin/sh", &args)
-    }
-
-    fn github_login(&self) -> Result<()> {
-        let token = prompt_secret("GitHub token (input hidden): ")?;
-        if token.trim().is_empty() {
-            bail!("empty token");
-        }
-
-        let gh_config_dir = self.fake_home.join(".config/gh");
-        fs::create_dir_all(&gh_config_dir).with_context(|| {
-            format!(
-                "failed to create GitHub config directory `{}`",
-                gh_config_dir.display()
-            )
-        })?;
-        fs::set_permissions(&gh_config_dir, fs::Permissions::from_mode(0o700)).with_context(
-            || {
-                format!(
-                    "failed to restrict GitHub config directory `{}`",
-                    gh_config_dir.display()
-                )
-            },
-        )?;
-
-        let hosts_path = gh_config_dir.join("hosts.yml");
-        let content = format!(
-            "github.com:\n    oauth_token: {}\n    git_protocol: https\n    user: clanker-jail\n",
-            token.trim()
-        );
-        write_secret_file(&hosts_path, &content)?;
-
-        let git_credentials = self.fake_home.join(".git-credentials");
-        write_secret_file(
-            &git_credentials,
-            &format!("https://x-access-token:{}@github.com\n", token.trim()),
-        )?;
-
-        let gitconfig = self.fake_home.join(".gitconfig");
-        let gitconfig_content = format!(
-            "[credential]\n\thelper = store --file={}\n[url \"https://github.com/\"]\n\tinsteadOf = git@github.com:\n",
-            git_credentials.display()
-        );
-        write_secret_file(&gitconfig, &gitconfig_content)?;
-
-        println!(
-            "stored GitHub HTTPS credentials under fake home `{}`",
-            self.fake_home.display()
-        );
-        println!("use a limited-scope token; jailed Git and gh will not use your host auth store");
-        Ok(())
+        self.run_sandboxed("/bin/sh", &args, None)
     }
 
     fn write_profile(&self) -> Result<PathBuf> {
@@ -362,7 +344,6 @@ echo "doctor ok"
             Path::new("/usr/share"),
             Path::new("/System/Library"),
             Path::new("/Library/Apple"),
-            Path::new("/opt/homebrew"),
             Path::new("/etc/profile"),
             Path::new("/etc/paths"),
             Path::new("/etc/manpaths"),
@@ -370,13 +351,19 @@ echo "doctor ok"
             Path::new("/etc/manpaths.d"),
             Path::new("/private/etc/ssl/openssl.cnf"),
             Path::new("/private/etc/ssl/cert.pem"),
+            Path::new("/System/Volumes/Preboot/Cryptexes/OS"),
+            Path::new("/dev/null"),
+            Path::new("/dev/autofs_nowait"),
+            Path::new("/Users/dani/.CFUserTextEncoding"),
+            Path::new("/Library/Preferences/com.apple.networkd.plist"),
+            Path::new("/private/var/db/timezone/tz"),
         ] {
             if path.exists() {
                 read_paths.insert(canonical_or_absolute(path)?);
             }
         }
 
-        for executable in ["pi", "node", "npm", "npx", "git", "gh", "curl", "sh", "zsh"] {
+        for executable in ["pi", "node", "npm", "npx", "git", "curl", "sh", "zsh"] {
             if let Ok(path) = find_executable(executable) {
                 add_path_and_ancestors(&mut read_paths, &path)?;
             }
@@ -495,6 +482,10 @@ echo "doctor ok"
             "GIT_CONFIG_GLOBAL".to_string(),
             self.fake_home.join(".gitconfig").into_os_string(),
         );
+        envs.insert(
+            "PI_CODING_AGENT_DIR".to_string(),
+            self.agent_dir().into_os_string(),
+        );
         envs.insert("PI_TELEMETRY".to_string(), OsString::from("0"));
         envs
     }
@@ -587,24 +578,4 @@ fn sandbox_escape(path: &Path) -> String {
 
 fn shell_escape(path: &Path) -> String {
     path.to_string_lossy().replace('"', "\\\"")
-}
-
-fn prompt_secret(prompt: &str) -> Result<String> {
-    print!("{prompt}");
-    io::stdout().flush().context("failed to flush stdout")?;
-
-    let _ = Command::new("stty").arg("-echo").status();
-    let mut input = String::new();
-    let result = io::stdin().read_line(&mut input);
-    let _ = Command::new("stty").arg("echo").status();
-    println!();
-
-    result.context("failed to read token").map(|_| input)
-}
-
-fn write_secret_file(path: &Path, content: &str) -> Result<()> {
-    fs::write(path, content).with_context(|| format!("failed to write `{}`", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to restrict `{}`", path.display()))?;
-    Ok(())
 }
