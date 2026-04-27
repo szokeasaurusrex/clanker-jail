@@ -2,9 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
+<<<<<<< HEAD
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
+=======
+use std::fs;
+use std::io::{self, BufRead as _, Write as _};
+>>>>>>> 2693e59 (fix github login)
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -26,7 +31,7 @@ fn main() -> Result<()> {
             let context = JailContext::new(command.options)?;
             context.refuse_broad_cwd()?;
             context.prepare()?;
-            context.run_sandboxed("pi", &command.args, None)
+            context.run_sandboxed("pi", &command.args, None, None)
         }
         Commands::Exec(command) => {
             let context = JailContext::new(command.options)?;
@@ -47,19 +52,12 @@ fn main() -> Result<()> {
                 command.args.push("login".to_string());
             }
             command.args.insert(0, "@mariozechner/pi-ai".to_string());
-            context.run_sandboxed("npx", &command.args, Some(&context.agent_dir()))
+            context.run_sandboxed("npx", &command.args, Some(&context.agent_dir()), None)
         }
         Commands::GithubLogin(options) => {
             let context = JailContext::new(options)?;
-            context.refuse_broad_cwd()?;
             context.prepare()?;
-            context.ensure_agent_dir()?;
-            let args = vec![
-                "@mariozechner/pi-ai".to_string(),
-                "login".to_string(),
-                "github-copilot".to_string(),
-            ];
-            context.run_sandboxed("npx", &args, Some(&context.agent_dir()))
+            context.github_login()
         }
         Commands::Doctor(options) => {
             let context = JailContext::new(options)?;
@@ -104,7 +102,7 @@ enum Commands {
     Exec(ExecCommand),
     /// Launch @mariozechner/pi-ai's CLI login flow in the jail.
     PiLogin(PiCommand),
-    /// Store a limited GitHub HTTPS token in the fake home.
+    /// Open the GitHub PAT page, store the token in the fake home, and authenticate gh.
     GithubLogin(JailOptions),
     /// Validate core sandbox invariants.
     Doctor(JailOptions),
@@ -280,6 +278,37 @@ impl JailContext {
         Ok(())
     }
 
+    fn github_login(&self) -> Result<()> {
+        const PAT_URL: &str = "https://github.com/settings/personal-access-tokens";
+
+        open_url(PAT_URL);
+        eprintln!(
+            "GitHub will open to create a fine-grained token at {PAT_URL}.\nPaste the token here and press Enter:"
+        );
+        io::stderr().flush().ok();
+
+        let mut token = String::new();
+        let mut stdin = io::stdin().lock();
+        stdin
+            .read_line(&mut token)
+            .context("failed to read GitHub token from stdin")?;
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            bail!("no GitHub token provided");
+        }
+
+        let args = vec![
+            "auth".to_string(),
+            "login".to_string(),
+            "--with-token".to_string(),
+            "--hostname".to_string(),
+            "github.com".to_string(),
+            "--git-protocol".to_string(),
+            "https".to_string(),
+        ];
+        self.run_sandboxed("gh", &args, Some(&self.fake_home), Some(token.as_bytes()))
+    }
+
     fn refuse_broad_cwd(&self) -> Result<()> {
         if self.no_refuse_broad_cwd {
             return Ok(());
@@ -306,6 +335,7 @@ impl JailContext {
         program: &str,
         args: &[String],
         current_dir: Option<&Path>,
+        stdin_data: Option<&[u8]>,
     ) -> Result<()> {
         let program_path = find_executable(program)?;
         let mut proxy = self.start_proxy()?;
@@ -325,7 +355,21 @@ impl JailContext {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        let status = command.status().context("failed to launch sandbox-exec")?;
+        let status = if let Some(stdin_data) = stdin_data {
+            let mut child = command
+                .stdin(Stdio::piped())
+                .spawn()
+                .context("failed to launch sandbox-exec")?;
+            if let Some(mut child_stdin) = child.stdin.take() {
+                child_stdin
+                    .write_all(stdin_data)
+                    .context("failed to write to sandboxed stdin")?;
+            }
+            child.wait().context("failed to wait for sandbox-exec")?
+        } else {
+            command.stdin(Stdio::inherit());
+            command.status().context("failed to launch sandbox-exec")?
+        };
 
         let shutdown_result = proxy.shutdown();
         self.cleanup_temp();
@@ -368,7 +412,8 @@ rm "$TMPDIR/.clanker-jail-doctor-tmp"
 if ls "{}" >/dev/null 2>&1; then echo "FAIL real home is readable"; exit 20; fi
 if ls "{}/.ssh" >/dev/null 2>&1; then echo "FAIL ~/.ssh is readable"; exit 21; fi
 if printenv SSH_AUTH_SOCK >/dev/null 2>&1; then echo "FAIL SSH_AUTH_SOCK leaked"; exit 22; fi
-if printenv GITHUB_TOKEN >/dev/null 2>&1; then echo "FAIL GITHUB_TOKEN leaked"; exit 23; fi
+if printenv GH_TOKEN >/dev/null 2>&1; then echo "FAIL GH_TOKEN leaked"; exit 23; fi
+if printenv GITHUB_TOKEN >/dev/null 2>&1; then echo "FAIL GITHUB_TOKEN leaked"; exit 24; fi
 if [ -n "$PI_CODING_AGENT_DIR" ] && [ -f "$PI_CODING_AGENT_DIR/auth.json" ]; then :; fi
 node -e 'if (process.stdin.isTTY) {{ process.stdin.setRawMode(true); process.stdin.setRawMode(false); }}'
 node --version >/dev/null
@@ -389,7 +434,7 @@ echo "doctor ok"
         );
 
         let args = vec!["-c".to_string(), script];
-        self.run_sandboxed("/bin/sh", &args, None)
+        self.run_sandboxed("/bin/sh", &args, None, None)
     }
 
     fn write_profile_with_executable(
@@ -476,7 +521,7 @@ echo "doctor ok"
 
         for executable in [
             "pi", "node", "npm", "npx", "git", "curl", "rg", "sh", "zsh", "rustup", "rustc",
-            "cargo",
+            "cargo", "gh"
         ] {
             if let Ok(path) = find_executable(executable) {
                 add_path_and_ancestors(&mut read_paths, &path)?;
@@ -980,6 +1025,13 @@ fn current_tty() -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(path))
+}
+
+fn open_url(url: &str) {
+    match Command::new("/usr/bin/open").arg(url).status() {
+        Ok(status) if status.success() => {}
+        Ok(_) | Err(_) => eprintln!("Could not open browser automatically. Visit {url}"),
+    }
 }
 
 fn now_millis() -> Result<u128> {

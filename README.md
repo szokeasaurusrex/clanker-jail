@@ -36,11 +36,13 @@ Run the `@mariozechner/pi-ai` CLI login flow in the jail:
 cargo run -- pi-login
 ```
 
-Store a limited GitHub HTTPS token in the fake home:
+Store a fine-grained GitHub PAT for `gh` in the fake home:
 
 ```sh
 cargo run -- github-login
 ```
+
+That command opens the GitHub PAT page, prompts you to paste the token, and then authenticates `gh` with `gh auth login --with-token` inside the jail.
 
 Audit the generated sandbox profile:
 
@@ -79,5 +81,5 @@ Set `CLANKER_EGRESS_PROXY_BIN=/path/to/clanker-egress-proxy` to test a developme
 - Do not launch from a directory containing secrets you do not want Pi to read.
 - The launcher refuses obviously broad directories by default, including `/`, `/tmp`, `/Users`, and the real home directory.
 - SSH agent sockets, GitHub tokens, cloud credentials, npm tokens, and model API keys are not inherited by default.
-- GitHub auth is written to the fake home for HTTPS-based workflows. Prefer read-only or otherwise tightly scoped tokens.
+- GitHub auth is stored by `gh` in the fake home config directory. Prefer read-only or otherwise tightly scoped tokens.
 - `sandbox-exec` is useful for damage-radius reduction but should not be treated as a hardened VM boundary.
