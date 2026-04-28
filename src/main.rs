@@ -25,6 +25,16 @@ fn main() -> Result<()> {
             context.prepare()?;
             context.run_sandboxed("pi", &command.args, None)
         }
+        Commands::Exec(command) => {
+            let context = JailContext::new(command.options)?;
+            context.refuse_broad_cwd()?;
+            context.prepare()?;
+            let (program, args) = command
+                .args
+                .split_first()
+                .ok_or_else(|| anyhow!("exec requires a command to run"))?;
+            context.run_sandboxed(program, args, None)
+        }
         Commands::PiLogin(mut command) => {
             let context = JailContext::new(command.options)?;
             context.refuse_broad_cwd()?;
@@ -85,6 +95,8 @@ struct Cli {
 enum Commands {
     /// Launch Pi in the current directory.
     Pi(PiCommand),
+    /// Run an arbitrary command in the current directory using Pi's sandbox environment.
+    Exec(ExecCommand),
     /// Launch @mariozechner/pi-ai's CLI login flow in the jail.
     PiLogin(PiCommand),
     /// Store a limited GitHub HTTPS token in the fake home.
@@ -107,6 +119,15 @@ struct PiCommand {
     options: JailOptions,
     /// Arguments forwarded to pi after `--`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct ExecCommand {
+    #[command(flatten)]
+    options: JailOptions,
+    /// Command and arguments to run after `--`.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
 
@@ -281,8 +302,8 @@ impl JailContext {
         args: &[String],
         current_dir: Option<&Path>,
     ) -> Result<()> {
-        let profile_path = self.write_profile()?;
         let program_path = find_executable(program)?;
+        let profile_path = self.write_profile_with_executable(&program_path)?;
 
         let mut command = Command::new("sandbox-exec");
         command
@@ -346,15 +367,22 @@ echo "doctor ok"
         self.run_sandboxed("/bin/sh", &args, None)
     }
 
-    fn write_profile(&self) -> Result<PathBuf> {
+    fn write_profile_with_executable(&self, executable: &Path) -> Result<PathBuf> {
+        self.write_profile_with_extra_read_paths(&[executable])
+    }
+
+    fn write_profile_with_extra_read_paths(&self, extra_read_paths: &[&Path]) -> Result<PathBuf> {
         let path = self.tmp_dir.join("sandbox.sb");
-        fs::write(&path, self.profile()?)
+        fs::write(&path, self.profile_with_extra_read_paths(extra_read_paths)?)
             .with_context(|| format!("failed to write sandbox profile `{}`", path.display()))?;
         Ok(path)
     }
 
     /// Builds the read and write path sets that make up the sandbox policy.
-    fn collect_path_sets(&self) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
+    fn collect_path_sets(
+        &self,
+        extra_read_paths: &[&Path],
+    ) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
         let mut read_paths: BTreeSet<PathBuf> = BTreeSet::new();
         let mut write_paths: BTreeSet<PathBuf> = BTreeSet::new();
 
@@ -382,10 +410,12 @@ echo "doctor ok"
             Path::new("/opt/homebrew/sbin"),
             Path::new("/opt/homebrew/opt"),
             Path::new("/opt/homebrew/Cellar"),
+            Path::new("/opt/homebrew/etc"),
             Path::new("/usr/local/bin"),
             Path::new("/usr/local/sbin"),
             Path::new("/usr/local/opt"),
             Path::new("/usr/local/Cellar"),
+            Path::new("/usr/local/etc"),
             Path::new("/etc/profile"),
             Path::new("/etc/paths"),
             Path::new("/etc/manpaths"),
@@ -416,6 +446,20 @@ echo "doctor ok"
 
         for path in &self.extra_read {
             read_paths.insert(canonical_or_absolute(path)?);
+        }
+        for path in extra_read_paths {
+            add_path_and_ancestors(&mut read_paths, path)?;
+        }
+
+        // Some Apple developer tools, notably xcrun invoked by cc, write cache
+        // files under Darwin's per-user temp/cache directories instead of the
+        // TMPDIR value supplied to the sandboxed process.
+        for name in ["DARWIN_USER_TEMP_DIR", "DARWIN_USER_CACHE_DIR"] {
+            if let Some(path) = getconf_path(name) {
+                let canonical = canonical_or_absolute(&path)?;
+                read_paths.insert(canonical.clone());
+                write_paths.insert(canonical);
+            }
         }
 
         // The active cargo home (from CARGO_HOME env var, or ~/.cargo if unset) is
@@ -458,7 +502,11 @@ echo "doctor ok"
     }
 
     fn profile(&self) -> Result<String> {
-        let (read_paths, write_paths) = self.collect_path_sets()?;
+        self.profile_with_extra_read_paths(&[])
+    }
+
+    fn profile_with_extra_read_paths(&self, extra_read_paths: &[&Path]) -> Result<String> {
+        let (read_paths, write_paths) = self.collect_path_sets(extra_read_paths)?;
 
         let mut profile = String::new();
         profile.push_str("(version 1)\n");
@@ -558,6 +606,7 @@ echo "doctor ok"
             "GIT_CONFIG_GLOBAL".to_string(),
             self.fake_home.join(".gitconfig").into_os_string(),
         );
+        envs.insert("GIT_CONFIG_NOSYSTEM".to_string(), OsString::from("1"));
         envs.insert(
             "PI_CODING_AGENT_DIR".to_string(),
             self.agent_dir().into_os_string(),
@@ -618,6 +667,19 @@ fn find_executable(name: &str) -> Result<PathBuf> {
 
     path.canonicalize()
         .with_context(|| format!("failed to canonicalize executable `{}`", path.display()))
+}
+
+fn getconf_path(name: &str) -> Option<PathBuf> {
+    let output = Command::new("/usr/bin/getconf").arg(name).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
 }
 
 fn add_path_and_ancestors(paths: &mut BTreeSet<PathBuf>, executable: &Path) -> Result<()> {

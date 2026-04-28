@@ -24,6 +24,12 @@ Forward Pi arguments after `--`:
 cargo run -- pi -- --model gpt-5.2
 ```
 
+Run another command with the same sandbox environment Pi uses:
+
+```sh
+cargo run -- exec -- cargo test
+```
+
 Run the `@mariozechner/pi-ai` CLI login flow in the jail:
 
 ```sh
