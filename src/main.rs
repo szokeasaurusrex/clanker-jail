@@ -9,9 +9,9 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use clap::{Args, Parser, Subcommand};
 use git2::Repository;
 use home::{cargo_home, rustup_home};
-use clap::{Args, Parser, Subcommand};
 
 const APP_NAME: &str = "clanker-jail";
 
@@ -333,6 +333,8 @@ if [ -n "$PI_CODING_AGENT_DIR" ] && [ -f "$PI_CODING_AGENT_DIR/auth.json" ]; the
 node -e 'if (process.stdin.isTTY) {{ process.stdin.setRawMode(true); process.stdin.setRawMode(false); }}'
 node --version >/dev/null
 pi --version >/dev/null
+if command -v rg >/dev/null 2>&1; then rg --version >/dev/null; fi
+git --version >/dev/null
 /usr/bin/curl -sS -I -L --max-time 10 https://pi.dev >/dev/null
 echo "doctor ok"
 "#,
@@ -369,6 +371,21 @@ echo "doctor ok"
             Path::new("/usr/share"),
             Path::new("/System/Library"),
             Path::new("/Library/Apple"),
+            Path::new("/Library/Developer"),
+            Path::new("/Applications/Xcode.app"),
+            Path::new("/Applications/Xcode-beta.app"),
+            // Homebrew executables often load dylibs through stable `opt`
+            // symlinks (for example, ripgrep -> pcre2).  `find_executable`
+            // adds the executable path, but dyld still needs read access to
+            // the Homebrew package store and link farm.
+            Path::new("/opt/homebrew/bin"),
+            Path::new("/opt/homebrew/sbin"),
+            Path::new("/opt/homebrew/opt"),
+            Path::new("/opt/homebrew/Cellar"),
+            Path::new("/usr/local/bin"),
+            Path::new("/usr/local/sbin"),
+            Path::new("/usr/local/opt"),
+            Path::new("/usr/local/Cellar"),
             Path::new("/etc/profile"),
             Path::new("/etc/paths"),
             Path::new("/etc/manpaths"),
@@ -388,7 +405,10 @@ echo "doctor ok"
             }
         }
 
-        for executable in ["pi", "node", "npm", "npx", "git", "curl", "sh", "zsh", "rustup", "rustc", "cargo"] {
+        for executable in [
+            "pi", "node", "npm", "npx", "git", "curl", "rg", "sh", "zsh", "rustup", "rustc",
+            "cargo",
+        ] {
             if let Ok(path) = find_executable(executable) {
                 add_path_and_ancestors(&mut read_paths, &path)?;
             }
