@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use git2::Repository;
-use home::cargo_home;
+use home::{cargo_home, rustup_home};
 use clap::{Args, Parser, Subcommand};
 
 const APP_NAME: &str = "clanker-jail";
@@ -60,6 +60,12 @@ fn main() -> Result<()> {
             context.cleanup_temp();
             Ok(())
         }
+        Commands::AgentDir(options) => {
+            let context = JailContext::new(options)?;
+            context.ensure_agent_dir()?;
+            println!("{}", context.agent_dir().display());
+            Ok(())
+        }
     }
 }
 
@@ -87,6 +93,12 @@ enum Commands {
     Doctor(JailOptions),
     /// Print the generated sandbox-exec profile.
     PrintProfile(JailOptions),
+    /// Print the path to the persistent Pi agent directory.
+    ///
+    /// Useful for version-controlling your agent configuration:
+    ///
+    ///   cd $(clanker-jail agent-dir)
+    AgentDir(JailOptions),
 }
 
 #[derive(Args, Debug)]
@@ -148,6 +160,7 @@ struct JailContext {
     no_refuse_broad_cwd: bool,
     git_dirs: Vec<PathBuf>,
     detected_cargo_home: Option<PathBuf>,
+    detected_rustup_home: Option<PathBuf>,
 }
 
 impl JailContext {
@@ -174,6 +187,7 @@ impl JailContext {
 
         let git_dirs = detect_git_dirs(&cwd);
         let detected_cargo_home = cargo_home().ok();
+        let detected_rustup_home = rustup_home().ok();
 
         Ok(Self {
             real_home,
@@ -188,6 +202,7 @@ impl JailContext {
             no_refuse_broad_cwd: config.no_refuse_broad_cwd,
             git_dirs,
             detected_cargo_home,
+            detected_rustup_home,
         })
     }
 
@@ -373,7 +388,7 @@ echo "doctor ok"
             }
         }
 
-        for executable in ["pi", "node", "npm", "npx", "git", "curl", "sh", "zsh"] {
+        for executable in ["pi", "node", "npm", "npx", "git", "curl", "sh", "zsh", "rustup", "rustc", "cargo"] {
             if let Ok(path) = find_executable(executable) {
                 add_path_and_ancestors(&mut read_paths, &path)?;
             }
@@ -389,6 +404,14 @@ echo "doctor ok"
             let canonical = canonical_or_absolute(cargo_home)?;
             read_paths.insert(canonical.clone());
             write_paths.insert(canonical);
+        }
+
+        // The rustup home is read-only: the agent reads toolchains but must not
+        // modify the rustup installation.
+        if let Some(ref rustup_home) = self.detected_rustup_home
+            && let Ok(canonical) = canonical_or_absolute(rustup_home)
+        {
+            read_paths.insert(canonical);
         }
 
         // Git directories (.git or the worktree-specific + common dirs) are readable and
@@ -520,6 +543,16 @@ echo "doctor ok"
             self.agent_dir().into_os_string(),
         );
         envs.insert("PI_TELEMETRY".to_string(), OsString::from("0"));
+
+        // Pin cargo and rustup to their detected homes so they do not resolve
+        // relative to the fake HOME set above.
+        if let Some(ref path) = self.detected_cargo_home {
+            envs.insert("CARGO_HOME".to_string(), path.clone().into_os_string());
+        }
+        if let Some(ref path) = self.detected_rustup_home {
+            envs.insert("RUSTUP_HOME".to_string(), path.clone().into_os_string());
+        }
+
         envs
     }
 }
