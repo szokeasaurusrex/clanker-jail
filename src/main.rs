@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use git2::Repository;
+use home::cargo_home;
 use clap::{Args, Parser, Subcommand};
 
 const APP_NAME: &str = "clanker-jail";
@@ -144,6 +146,8 @@ struct JailContext {
     extra_read: Vec<PathBuf>,
     extra_write: Vec<PathBuf>,
     no_refuse_broad_cwd: bool,
+    git_dirs: Vec<PathBuf>,
+    detected_cargo_home: Option<PathBuf>,
 }
 
 impl JailContext {
@@ -168,6 +172,9 @@ impl JailContext {
         ));
         let tty_path = current_tty();
 
+        let git_dirs = detect_git_dirs(&cwd);
+        let detected_cargo_home = cargo_home().ok();
+
         Ok(Self {
             real_home,
             cwd,
@@ -179,6 +186,8 @@ impl JailContext {
             extra_read: config.allow_read,
             extra_write: config.allow_write,
             no_refuse_broad_cwd: config.no_refuse_broad_cwd,
+            git_dirs,
+            detected_cargo_home,
         })
     }
 
@@ -327,9 +336,10 @@ echo "doctor ok"
         Ok(path)
     }
 
-    fn profile(&self) -> Result<String> {
-        let mut read_paths = BTreeSet::new();
-        let mut write_paths = BTreeSet::new();
+    /// Builds the read and write path sets that make up the sandbox policy.
+    fn collect_path_sets(&self) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
+        let mut read_paths: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut write_paths: BTreeSet<PathBuf> = BTreeSet::new();
 
         for path in [
             &self.cwd,
@@ -373,6 +383,23 @@ echo "doctor ok"
             read_paths.insert(canonical_or_absolute(path)?);
         }
 
+        // The active cargo home (from CARGO_HOME env var, or ~/.cargo if unset) is
+        // readable and writable so the agent can fetch and cache crates.
+        if let Some(ref cargo_home) = self.detected_cargo_home {
+            let canonical = canonical_or_absolute(cargo_home)?;
+            read_paths.insert(canonical.clone());
+            write_paths.insert(canonical);
+        }
+
+        // Git directories (.git or the worktree-specific + common dirs) are readable and
+        // writable so git operations inside the jail work correctly.
+        for dir in &self.git_dirs {
+            if let Ok(canonical) = canonical_or_absolute(dir) {
+                read_paths.insert(canonical.clone());
+                write_paths.insert(canonical);
+            }
+        }
+
         for path in [&self.cwd, &self.fake_home, &self.tmp_dir] {
             let canonical = canonical_or_absolute(path)?;
             read_paths.insert(canonical.clone());
@@ -383,6 +410,12 @@ echo "doctor ok"
             read_paths.insert(canonical.clone());
             write_paths.insert(canonical);
         }
+
+        Ok((read_paths, write_paths))
+    }
+
+    fn profile(&self) -> Result<String> {
+        let (read_paths, write_paths) = self.collect_path_sets()?;
 
         let mut profile = String::new();
         profile.push_str("(version 1)\n");
@@ -489,6 +522,31 @@ echo "doctor ok"
         envs.insert("PI_TELEMETRY".to_string(), OsString::from("0"));
         envs
     }
+}
+
+/// Returns the absolute paths of git directories relevant to `cwd` using
+/// libgit2 (via the `git2` crate).
+///
+/// `repo.path()` gives the per-worktree git dir (e.g. `.git/worktrees/<name>`
+/// for a linked worktree).  `repo.commondir()` gives the shared git dir (the
+/// main `.git` that all worktrees share).  For a plain checkout the two paths
+/// are identical and the duplicate is dropped.
+///
+/// Returns an empty vec if `cwd` is not inside a git repo.
+fn detect_git_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let Ok(repo) = Repository::discover(cwd) else {
+        return Vec::new();
+    };
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for raw in [repo.path(), repo.commondir()] {
+        // libgit2 always returns absolute paths here.
+        let path = raw.to_path_buf();
+        if !dirs.contains(&path) {
+            dirs.push(path);
+        }
+    }
+    dirs
 }
 
 fn find_executable(name: &str) -> Result<PathBuf> {

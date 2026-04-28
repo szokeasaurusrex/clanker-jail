@@ -18,3 +18,5 @@ pedantic = { level = "warn", priority = -1 }
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.49", features = ["derive"] }
+git2 = "0.20.4"
+home = "0.5.12"
