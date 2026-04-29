@@ -356,6 +356,7 @@ node --version >/dev/null
 pi --version >/dev/null
 if command -v rg >/dev/null 2>&1; then rg --version >/dev/null; fi
 git --version >/dev/null
+xcrun --sdk macosx --show-sdk-path >/dev/null
 /usr/bin/curl -sS -I -L --max-time 10 https://pi.dev >/dev/null
 echo "doctor ok"
 "#,
@@ -427,6 +428,9 @@ echo "doctor ok"
             Path::new("/dev/null"),
             Path::new("/dev/autofs_nowait"),
             Path::new("/Users/dani/.CFUserTextEncoding"),
+            // Xcode records license acceptance in this root-owned preference file.
+            // Without it, xcrun/cc report that agreements were not accepted.
+            Path::new("/Library/Preferences/com.apple.dt.Xcode.plist"),
             Path::new("/Library/Preferences/com.apple.networkd.plist"),
             Path::new("/private/var/db/timezone/tz"),
         ] {
