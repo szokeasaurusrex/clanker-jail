@@ -594,6 +594,13 @@ echo "doctor ok"
             "XDG_DATA_HOME".to_string(),
             self.fake_home.join(".local/share").into_os_string(),
         );
+        envs.insert("SWIFT_DISABLE_SANDBOX".to_string(), OsString::from("1"));
+        envs.insert(
+            "SWIFTPM_CACHE_PATH".to_string(),
+            self.fake_home
+                .join(".cache/org.swift.swiftpm")
+                .into_os_string(),
+        );
         envs.insert(
             "NPM_CONFIG_USERCONFIG".to_string(),
             self.fake_home.join(".npmrc").into_os_string(),
