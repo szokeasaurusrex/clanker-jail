@@ -7,7 +7,7 @@ The default model is:
 - current directory: read/write, with the same path inside and outside the jail
 - fake home: read/write, persisted at `~/Library/Application Support/clanker-jail/home`
 - temp: read/write, fresh per run under `/tmp`
-- network: unrestricted
+- network: public-internet egress through a filtered SOCKS5 proxy; direct network access is denied
 - environment: deny-by-default, with no API keys or credential variables inherited
 
 This is intended to limit prompt-injection and agent-error blast radius by preventing the agent from reading host secrets in the first place. It is not VM-grade isolation.
@@ -63,6 +63,16 @@ cargo run -- doctor
 - `--allow-read <path>`: add an extra read-only path.
 - `--allow-write <path>`: add an extra read/write path.
 - `--no-refuse-broad-cwd`: allow launching from broad directories like the real home.
+
+## Egress proxy
+
+`clanker-jail` starts `clanker-egress-proxy` before launching the sandboxed process and sets `ALL_PROXY`, `HTTP_PROXY`, and `HTTPS_PROXY` to a `socks5h://127.0.0.1:<port>` URL. `NO_PROXY` is set to an empty value so proxy-aware tools do not bypass the proxy for localhost.
+
+The proxy blocks host-local, private, link-local, multicast, unspecified, broadcast, and documented/reserved destinations where Rust's standard library exposes classification. Hostname requests are resolved inside the proxy, and only allowed public addresses are used.
+
+Tools that ignore proxy environment variables may fail network access. `HTTP_PROXY=socks5h://...` is best-effort for tools that accept curl-style SOCKS proxy URLs; `ALL_PROXY` is the primary supported variable.
+
+Set `CLANKER_EGRESS_PROXY_BIN=/path/to/clanker-egress-proxy` to test a development proxy binary.
 
 ## Security Notes
 
