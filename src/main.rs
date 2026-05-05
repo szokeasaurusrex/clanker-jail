@@ -10,8 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use git2::Repository;
 use home::{cargo_home, rustup_home};
+
+mod git_discovery;
 
 const APP_NAME: &str = "clanker-jail";
 
@@ -206,7 +207,7 @@ impl JailContext {
         ));
         let tty_path = current_tty();
 
-        let git_dirs = detect_git_dirs(&cwd);
+        let git_dirs = git_discovery::discover_git_dirs(&cwd);
         let detected_cargo_home = cargo_home().ok();
         let detected_rustup_home = rustup_home().ok();
 
@@ -635,31 +636,6 @@ echo "doctor ok"
 
         envs
     }
-}
-
-/// Returns the absolute paths of git directories relevant to `cwd` using
-/// libgit2 (via the `git2` crate).
-///
-/// `repo.path()` gives the per-worktree git dir (e.g. `.git/worktrees/<name>`
-/// for a linked worktree).  `repo.commondir()` gives the shared git dir (the
-/// main `.git` that all worktrees share).  For a plain checkout the two paths
-/// are identical and the duplicate is dropped.
-///
-/// Returns an empty vec if `cwd` is not inside a git repo.
-fn detect_git_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let Ok(repo) = Repository::discover(cwd) else {
-        return Vec::new();
-    };
-
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for raw in [repo.path(), repo.commondir()] {
-        // libgit2 always returns absolute paths here.
-        let path = raw.to_path_buf();
-        if !dirs.contains(&path) {
-            dirs.push(path);
-        }
-    }
-    dirs
 }
 
 fn find_executable(name: &str) -> Result<PathBuf> {
