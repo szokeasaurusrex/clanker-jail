@@ -2,19 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
-<<<<<<< HEAD
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
-use std::net::{SocketAddr, TcpListener};
-=======
 use std::fs;
-use std::io::{self, BufRead as _, Write as _};
->>>>>>> 2693e59 (fix github login)
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
@@ -31,7 +23,7 @@ fn main() -> Result<()> {
             let context = JailContext::new(command.options)?;
             context.refuse_broad_cwd()?;
             context.prepare()?;
-            context.run_sandboxed("pi", &command.args, None, None)
+            context.run_sandboxed("pi", &command.args, None)
         }
         Commands::Exec(command) => {
             let context = JailContext::new(command.options)?;
@@ -52,12 +44,19 @@ fn main() -> Result<()> {
                 command.args.push("login".to_string());
             }
             command.args.insert(0, "@mariozechner/pi-ai".to_string());
-            context.run_sandboxed("npx", &command.args, Some(&context.agent_dir()), None)
+            context.run_sandboxed("npx", &command.args, Some(&context.agent_dir()))
         }
         Commands::GithubLogin(options) => {
             let context = JailContext::new(options)?;
+            context.refuse_broad_cwd()?;
             context.prepare()?;
-            context.github_login()
+            context.ensure_agent_dir()?;
+            let args = vec![
+                "@mariozechner/pi-ai".to_string(),
+                "login".to_string(),
+                "github-copilot".to_string(),
+            ];
+            context.run_sandboxed("npx", &args, Some(&context.agent_dir()))
         }
         Commands::Doctor(options) => {
             let context = JailContext::new(options)?;
@@ -67,9 +66,7 @@ fn main() -> Result<()> {
         Commands::PrintProfile(options) => {
             let context = JailContext::new(options)?;
             context.prepare()?;
-            let mut proxy = context.start_proxy()?;
-            println!("{}", context.profile(proxy.addr)?);
-            proxy.shutdown()?;
+            println!("{}", context.profile()?);
             context.cleanup_temp();
             Ok(())
         }
@@ -102,7 +99,7 @@ enum Commands {
     Exec(ExecCommand),
     /// Launch @mariozechner/pi-ai's CLI login flow in the jail.
     PiLogin(PiCommand),
-    /// Open the GitHub PAT page, store the token in the fake home, and authenticate gh.
+    /// Store a limited GitHub HTTPS token in the fake home.
     GithubLogin(JailOptions),
     /// Validate core sandbox invariants.
     Doctor(JailOptions),
@@ -278,37 +275,6 @@ impl JailContext {
         Ok(())
     }
 
-    fn github_login(&self) -> Result<()> {
-        const PAT_URL: &str = "https://github.com/settings/personal-access-tokens";
-
-        open_url(PAT_URL);
-        eprintln!(
-            "GitHub will open to create a fine-grained token at {PAT_URL}.\nPaste the token here and press Enter:"
-        );
-        io::stderr().flush().ok();
-
-        let mut token = String::new();
-        let mut stdin = io::stdin().lock();
-        stdin
-            .read_line(&mut token)
-            .context("failed to read GitHub token from stdin")?;
-        let token = token.trim().to_string();
-        if token.is_empty() {
-            bail!("no GitHub token provided");
-        }
-
-        let args = vec![
-            "auth".to_string(),
-            "login".to_string(),
-            "--with-token".to_string(),
-            "--hostname".to_string(),
-            "github.com".to_string(),
-            "--git-protocol".to_string(),
-            "https".to_string(),
-        ];
-        self.run_sandboxed("gh", &args, Some(&self.fake_home), Some(token.as_bytes()))
-    }
-
     fn refuse_broad_cwd(&self) -> Result<()> {
         if self.no_refuse_broad_cwd {
             return Ok(());
@@ -335,11 +301,9 @@ impl JailContext {
         program: &str,
         args: &[String],
         current_dir: Option<&Path>,
-        stdin_data: Option<&[u8]>,
     ) -> Result<()> {
         let program_path = find_executable(program)?;
-        let mut proxy = self.start_proxy()?;
-        let profile_path = self.write_profile_with_executable(&program_path, proxy.addr)?;
+        let profile_path = self.write_profile_with_executable(&program_path)?;
 
         let mut command = Command::new("sandbox-exec");
         command
@@ -350,31 +314,15 @@ impl JailContext {
             .args(args)
             .current_dir(current_dir.unwrap_or(&self.cwd))
             .env_clear()
-            .envs(self.safe_env(Some(proxy.addr)))
+            .envs(self.safe_env())
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        let status = if let Some(stdin_data) = stdin_data {
-            let mut child = command
-                .stdin(Stdio::piped())
-                .spawn()
-                .context("failed to launch sandbox-exec")?;
-            if let Some(mut child_stdin) = child.stdin.take() {
-                child_stdin
-                    .write_all(stdin_data)
-                    .context("failed to write to sandboxed stdin")?;
-            }
-            child.wait().context("failed to wait for sandbox-exec")?
-        } else {
-            command.stdin(Stdio::inherit());
-            command.status().context("failed to launch sandbox-exec")?
-        };
+        let status = command.status().context("failed to launch sandbox-exec")?;
 
-        let shutdown_result = proxy.shutdown();
         self.cleanup_temp();
         let _ = fs::remove_file(profile_path);
-        shutdown_result?;
 
         match status.code() {
             Some(0) => Ok(()),
@@ -390,17 +338,6 @@ impl JailContext {
     }
 
     fn doctor(&self) -> Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .context("failed to bind doctor localhost test server")?;
-        let local_test_addr = listener
-            .local_addr()
-            .context("failed to read doctor localhost test server address")?;
-        thread::spawn(move || {
-            if let Ok((stream, _)) = listener.accept() {
-                drop(stream);
-            }
-        });
-
         let script = format!(
             r#"set -eu
 touch "$PWD/.clanker-jail-doctor-cwd"
@@ -412,8 +349,7 @@ rm "$TMPDIR/.clanker-jail-doctor-tmp"
 if ls "{}" >/dev/null 2>&1; then echo "FAIL real home is readable"; exit 20; fi
 if ls "{}/.ssh" >/dev/null 2>&1; then echo "FAIL ~/.ssh is readable"; exit 21; fi
 if printenv SSH_AUTH_SOCK >/dev/null 2>&1; then echo "FAIL SSH_AUTH_SOCK leaked"; exit 22; fi
-if printenv GH_TOKEN >/dev/null 2>&1; then echo "FAIL GH_TOKEN leaked"; exit 23; fi
-if printenv GITHUB_TOKEN >/dev/null 2>&1; then echo "FAIL GITHUB_TOKEN leaked"; exit 24; fi
+if printenv GITHUB_TOKEN >/dev/null 2>&1; then echo "FAIL GITHUB_TOKEN leaked"; exit 23; fi
 if [ -n "$PI_CODING_AGENT_DIR" ] && [ -f "$PI_CODING_AGENT_DIR/auth.json" ]; then :; fi
 node -e 'if (process.stdin.isTTY) {{ process.stdin.setRawMode(true); process.stdin.setRawMode(false); }}'
 node --version >/dev/null
@@ -421,41 +357,25 @@ pi --version >/dev/null
 if command -v rg >/dev/null 2>&1; then rg --version >/dev/null; fi
 git --version >/dev/null
 xcrun --sdk macosx --show-sdk-path >/dev/null
-if [ "${{NO_PROXY-unset}}" != "" ]; then echo "FAIL NO_PROXY is not empty"; exit 24; fi
 /usr/bin/curl -sS -I -L --max-time 10 https://pi.dev >/dev/null
-if /usr/bin/curl --noproxy '*' -sS --max-time 2 http://127.0.0.1:{} >/dev/null 2>&1; then echo "FAIL direct localhost access worked"; exit 25; fi
-if /usr/bin/curl -sS --max-time 2 http://127.0.0.1:{} >/dev/null 2>&1; then echo "FAIL proxied localhost access worked"; exit 26; fi
 echo "doctor ok"
 "#,
             shell_escape(&self.real_home),
-            shell_escape(&self.real_home),
-            local_test_addr.port(),
-            local_test_addr.port()
+            shell_escape(&self.real_home)
         );
 
         let args = vec!["-c".to_string(), script];
-        self.run_sandboxed("/bin/sh", &args, None, None)
+        self.run_sandboxed("/bin/sh", &args, None)
     }
 
-    fn write_profile_with_executable(
-        &self,
-        executable: &Path,
-        proxy_addr: SocketAddr,
-    ) -> Result<PathBuf> {
-        self.write_profile_with_extra_read_paths(&[executable], proxy_addr)
+    fn write_profile_with_executable(&self, executable: &Path) -> Result<PathBuf> {
+        self.write_profile_with_extra_read_paths(&[executable])
     }
 
-    fn write_profile_with_extra_read_paths(
-        &self,
-        extra_read_paths: &[&Path],
-        proxy_addr: SocketAddr,
-    ) -> Result<PathBuf> {
+    fn write_profile_with_extra_read_paths(&self, extra_read_paths: &[&Path]) -> Result<PathBuf> {
         let path = self.tmp_dir.join("sandbox.sb");
-        fs::write(
-            &path,
-            self.profile_with_extra_read_paths(extra_read_paths, proxy_addr)?,
-        )
-        .with_context(|| format!("failed to write sandbox profile `{}`", path.display()))?;
+        fs::write(&path, self.profile_with_extra_read_paths(extra_read_paths)?)
+            .with_context(|| format!("failed to write sandbox profile `{}`", path.display()))?;
         Ok(path)
     }
 
@@ -521,7 +441,7 @@ echo "doctor ok"
 
         for executable in [
             "pi", "node", "npm", "npx", "git", "curl", "rg", "sh", "zsh", "rustup", "rustc",
-            "cargo", "gh"
+            "cargo",
         ] {
             if let Ok(path) = find_executable(executable) {
                 add_path_and_ancestors(&mut read_paths, &path)?;
@@ -585,15 +505,11 @@ echo "doctor ok"
         Ok((read_paths, write_paths))
     }
 
-    fn profile(&self, proxy_addr: SocketAddr) -> Result<String> {
-        self.profile_with_extra_read_paths(&[], proxy_addr)
+    fn profile(&self) -> Result<String> {
+        self.profile_with_extra_read_paths(&[])
     }
 
-    fn profile_with_extra_read_paths(
-        &self,
-        extra_read_paths: &[&Path],
-        proxy_addr: SocketAddr,
-    ) -> Result<String> {
+    fn profile_with_extra_read_paths(&self, extra_read_paths: &[&Path]) -> Result<String> {
         let (read_paths, write_paths) = self.collect_path_sets(extra_read_paths)?;
 
         let mut profile = String::new();
@@ -603,13 +519,7 @@ echo "doctor ok"
         profile.push_str("(allow signal (target self))\n");
         profile.push_str("(allow sysctl-read)\n");
         profile.push_str("(allow mach-lookup)\n");
-        profile.push_str("(deny network*)\n");
-        writeln!(
-            profile,
-            "(allow network-outbound (remote ip \"localhost:{}\"))",
-            proxy_addr.port()
-        )
-        .context("failed to build sandbox profile")?;
+        profile.push_str("(allow network*)\n");
         profile.push_str("(allow file-read-metadata)\n");
         profile.push_str("(allow file-map-executable)\n");
         profile.push_str("(allow file-read*");
@@ -649,11 +559,7 @@ echo "doctor ok"
         Ok(profile)
     }
 
-    fn start_proxy(&self) -> Result<EgressProxy> {
-        EgressProxy::start(&self.tmp_dir)
-    }
-
-    fn safe_env(&self, proxy_addr: Option<SocketAddr>) -> BTreeMap<String, OsString> {
+    fn safe_env(&self) -> BTreeMap<String, OsString> {
         let mut envs = BTreeMap::new();
         for name in [
             "PATH",
@@ -718,14 +624,6 @@ echo "doctor ok"
         );
         envs.insert("PI_TELEMETRY".to_string(), OsString::from("0"));
 
-        if let Some(addr) = proxy_addr {
-            let proxy_url = format!("socks5h://{addr}");
-            envs.insert("ALL_PROXY".to_string(), OsString::from(&proxy_url));
-            envs.insert("HTTP_PROXY".to_string(), OsString::from(&proxy_url));
-            envs.insert("HTTPS_PROXY".to_string(), OsString::from(&proxy_url));
-            envs.insert("NO_PROXY".to_string(), OsString::new());
-        }
-
         // Pin cargo and rustup to their detected homes so they do not resolve
         // relative to the fake HOME set above.
         if let Some(ref path) = self.detected_cargo_home {
@@ -736,130 +634,6 @@ echo "doctor ok"
         }
 
         envs
-    }
-}
-
-#[derive(Debug)]
-struct EgressProxy {
-    child: Child,
-    addr: SocketAddr,
-    stdin: Option<ChildStdin>,
-    stdout_log: PathBuf,
-    stderr_log: PathBuf,
-    shutdown_started: bool,
-}
-
-impl EgressProxy {
-    fn start(tmp_dir: &Path) -> Result<Self> {
-        let binary = find_egress_proxy_binary().context("failed to locate clanker-egress-proxy")?;
-        let stdout_log = tmp_dir.join("clanker-egress-proxy.stdout.log");
-        let stderr_log = tmp_dir.join("clanker-egress-proxy.stderr.log");
-        let stderr = File::create(&stderr_log)
-            .with_context(|| format!("failed to create `{}`", stderr_log.display()))?;
-
-        let mut child = Command::new(&binary)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .with_context(|| format!("failed to start `{}`", binary.display()))?;
-
-        let stdout = child.stdout.take().ok_or_else(|| {
-            anyhow!(
-                "failed to capture clanker-egress-proxy stdout; stderr log: {}",
-                stderr_log.display()
-            )
-        })?;
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line).with_context(|| {
-            format!(
-                "failed to read clanker-egress-proxy startup line; stderr log: {}",
-                stderr_log.display()
-            )
-        })?;
-        if bytes == 0 {
-            let _ = child.wait();
-            bail!(
-                "clanker-egress-proxy exited before reporting its address; stderr log: {}",
-                stderr_log.display()
-            );
-        }
-        let addr_text = line
-            .trim()
-            .strip_prefix("CLANKER_EGRESS_PROXY=")
-            .ok_or_else(|| {
-                anyhow!(
-                    "invalid clanker-egress-proxy startup line `{}`",
-                    line.trim()
-                )
-            })?;
-        let addr: SocketAddr = addr_text
-            .parse()
-            .with_context(|| format!("invalid clanker-egress-proxy address `{addr_text}`"))?;
-
-        let mut stdout_file = File::create(&stdout_log)
-            .with_context(|| format!("failed to create `{}`", stdout_log.display()))?;
-        thread::spawn(move || {
-            let mut reader = reader;
-            let _ = std::io::copy(&mut reader, &mut stdout_file);
-        });
-
-        let stdin = child.stdin.take();
-
-        Ok(Self {
-            child,
-            addr,
-            stdin,
-            stdout_log,
-            stderr_log,
-            shutdown_started: false,
-        })
-    }
-
-    fn shutdown(&mut self) -> Result<()> {
-        if self.shutdown_started {
-            return Ok(());
-        }
-        self.shutdown_started = true;
-        if self
-            .child
-            .try_wait()
-            .context("failed to poll egress proxy")?
-            .is_some()
-        {
-            return Ok(());
-        }
-
-        drop(self.stdin.take());
-        for _ in 0..20 {
-            if self
-                .child
-                .try_wait()
-                .context("failed to poll egress proxy")?
-                .is_some()
-            {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        eprintln!(
-            "forcing clanker-egress-proxy cleanup; stdout log: {}; stderr log: {}",
-            self.stdout_log.display(),
-            self.stderr_log.display()
-        );
-        self.child.kill().context("failed to kill egress proxy")?;
-        self.child
-            .wait()
-            .context("failed to wait for egress proxy")?;
-        Ok(())
-    }
-}
-
-impl Drop for EgressProxy {
-    fn drop(&mut self) {
-        let _ = self.shutdown();
     }
 }
 
@@ -886,60 +660,6 @@ fn detect_git_dirs(cwd: &Path) -> Vec<PathBuf> {
         }
     }
     dirs
-}
-
-fn find_egress_proxy_binary() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("CLANKER_EGRESS_PROXY_BIN") {
-        return PathBuf::from(path)
-            .canonicalize()
-            .with_context(|| "failed to canonicalize CLANKER_EGRESS_PROXY_BIN".to_string());
-    }
-
-    if let Ok(current_exe) = env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        let sibling = parent.join("clanker-egress-proxy");
-        if sibling.exists() {
-            return sibling
-                .canonicalize()
-                .with_context(|| format!("failed to canonicalize `{}`", sibling.display()));
-        }
-        if current_exe
-            .file_name()
-            .is_some_and(|name| name == "clanker-jail")
-            && current_exe.to_string_lossy().contains("/target/")
-            && let Some(manifest) = find_workspace_manifest()
-        {
-            let status = Command::new("cargo")
-                .arg("build")
-                .arg("--manifest-path")
-                .arg(manifest)
-                .arg("-p")
-                .arg("clanker-egress-proxy")
-                .status()
-                .context("failed to build clanker-egress-proxy for development run")?;
-            if status.success() && sibling.exists() {
-                return sibling
-                    .canonicalize()
-                    .with_context(|| format!("failed to canonicalize `{}`", sibling.display()));
-            }
-        }
-    }
-
-    find_executable("clanker-egress-proxy")
-}
-
-fn find_workspace_manifest() -> Option<PathBuf> {
-    let mut dir = env::current_dir().ok()?;
-    loop {
-        let manifest = dir.join("Cargo.toml");
-        if manifest.exists() && dir.join("crates/clanker-egress-proxy/Cargo.toml").exists() {
-            return Some(manifest);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
 }
 
 fn find_executable(name: &str) -> Result<PathBuf> {
@@ -1025,13 +745,6 @@ fn current_tty() -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(path))
-}
-
-fn open_url(url: &str) {
-    match Command::new("/usr/bin/open").arg(url).status() {
-        Ok(status) if status.success() => {}
-        Ok(_) | Err(_) => eprintln!("Could not open browser automatically. Visit {url}"),
-    }
 }
 
 fn now_millis() -> Result<u128> {
