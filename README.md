@@ -57,6 +57,7 @@ cargo run -- doctor
 ## Options
 
 - `--home <path>`: override the persistent fake home.
+- A `.env` file in the fake home is loaded into the sandbox environment.
 - `--tmp-parent <path>`: override the temp parent, default `/tmp`.
 - `--keep-tmp`: keep the per-run temp dir after exit.
 - `--allow-env <NAME>`: pass one host environment variable.

@@ -315,7 +315,7 @@ impl JailContext {
             .args(args)
             .current_dir(current_dir.unwrap_or(&self.cwd))
             .env_clear()
-            .envs(self.safe_env())
+            .envs(self.safe_env()?)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -560,8 +560,21 @@ echo "doctor ok"
         Ok(profile)
     }
 
-    fn safe_env(&self) -> BTreeMap<String, OsString> {
+    fn safe_env(&self) -> Result<BTreeMap<String, OsString>> {
         let mut envs = BTreeMap::new();
+
+        let dotenv_path = self.fake_home.join(".env");
+        if dotenv_path.exists() {
+            for entry in dotenvy::from_path_iter(&dotenv_path)
+                .with_context(|| format!("failed to read dotenv file `{}`", dotenv_path.display()))?
+            {
+                let (name, value) = entry.with_context(|| {
+                    format!("failed to parse dotenv file `{}`", dotenv_path.display())
+                })?;
+                envs.insert(name, value.into());
+            }
+        }
+
         for name in [
             "PATH",
             "TERM",
@@ -634,7 +647,7 @@ echo "doctor ok"
             envs.insert("RUSTUP_HOME".to_string(), path.clone().into_os_string());
         }
 
-        envs
+        Ok(envs)
     }
 }
 
